@@ -2,27 +2,66 @@ import os
 import io
 import fitz
 import faiss
-import ollama
 import numpy as np
 import pandas as pd
 import streamlit as st
 from docx import Document
 from sentence_transformers import SentenceTransformer
 
-st.set_page_config(page_title="Local RAG Chatbot", layout="wide")
+from ollama import Client  # official Python client [web:394]
 
+
+# ---------- STREAMLIT CONFIG ----------
+
+st.set_page_config(page_title="Ollama Cloud RAG Chatbot", layout="wide")
+
+
+# ---------- OLLAMA CLOUD-ONLY CONFIG ----------
+
+# Try to read Ollama API key from Streamlit secrets (Cloud) or env vars (local)
+try:
+    # On Streamlit Cloud, define this in Settings → Secrets
+    OLLAMA_API_KEY = st.secrets["OLLAMA_API_KEY"]
+except Exception:
+    # Locally, use environment variable
+    OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+
+if not OLLAMA_API_KEY:
+    raise RuntimeError(
+        "OLLAMA_API_KEY not set.\n"
+        "Set it in Streamlit secrets (Cloud) or as an env var locally."
+    )
+
+# Cloud-only client: talk directly to Ollama's cloud API [web:405][web:413]
+# Note: host can be "https://ollama.com" or "https://ollama.com/api" depending on library version.
+ollama_client = Client(
+    host="https://ollama.com",
+    headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"},
+)
+
+MODE_LABEL = "Ollama Cloud"
+
+# Choose a cloud model (must exist in your Ollama cloud account) [web:413][web:456]
 EMBED_MODEL = "all-MiniLM-L6-v2"
-DEFAULT_LLM_MODEL = "gemma4:31b-cloud"
+CLOUD_MODEL = "gemma4:31b-cloud"
+DEFAULT_LLM_MODEL = CLOUD_MODEL
+
 CHUNK_SIZE = 300
 CHUNK_OVERLAP = 50
 TOP_K = 3
+
+
+# ---------- EMBEDDING MODEL ----------
 
 @st.cache_resource
 def get_embedder():
     return SentenceTransformer(EMBED_MODEL)
 
+
 embedder = get_embedder()
 
+
+# ---------- DOCUMENT LOADING & CHUNKING ----------
 
 def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     words = text.split()
@@ -88,6 +127,8 @@ def load_uploaded_document(uploaded_file):
     return None
 
 
+# ---------- VECTOR STORE ----------
+
 class VectorStore:
     def __init__(self, dim):
         self.index = faiss.IndexFlatL2(dim)
@@ -130,13 +171,14 @@ def build_store(uploaded_files):
     return store, loaded_docs, len(all_chunks)
 
 
+# ---------- LLM CALL USING OLLAMA CLOUD ----------
+
 def llm_call(prompt, model_name=DEFAULT_LLM_MODEL):
-    response = ollama.chat(
+    # Uses the configured ollama_client with OLLAMA_API_KEY against Ollama Cloud [web:394][web:405]
+    response = ollama_client.chat(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
-        options={
-            "temperature": 0.6
-        }
+        options={"temperature": 0.6},
     )
     return response["message"]["content"]
 
@@ -144,11 +186,11 @@ def llm_call(prompt, model_name=DEFAULT_LLM_MODEL):
 def rag_query(question, store, model_name, history, top_k):
     results = store.search(question, k=top_k)
 
-     # DEBUG LOGGING
-    print("\n[DEBUG] Retrieved context for question:", question)
-    for r in results:
-        print("Source:", r["source"])
-        print(r["text"][:500], "\n")
+    # DEBUG LOGGING
+    # print("\n[DEBUG] Retrieved context for question:", question)
+    # for r in results:
+    #     print("Source:", r["source"])
+    #     print(r["text"][:500], "\n")
 
     context = "\n\n---\n\n".join(
         [f"Source: {r['source']}\n{r['text']}" for r in results]
@@ -201,6 +243,9 @@ Answer:
     answer = llm_call(prompt, model_name)
     return answer, results
 
+
+# ---------- STREAMLIT STATE ----------
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "chat_history_pairs" not in st.session_state:
@@ -212,13 +257,23 @@ if "loaded_docs" not in st.session_state:
 if "chunk_count" not in st.session_state:
     st.session_state.chunk_count = 0
 
-st.title("Local RAG Chatbot")
-st.caption("Upload documents, build an index, and chat with them locally using Ollama.")
+
+# ---------- MAIN UI ----------
+
+st.title("Ollama Cloud RAG Chatbot")
+
+st.caption(
+    f"Upload documents, build an index, and chat with them using {MODE_LABEL} models."
+)
 
 with st.sidebar:
     st.header("Settings")
-    model_name = st.text_input("Ollama model", value=DEFAULT_LLM_MODEL)
+
+    st.markdown(f"**Current mode:** {MODE_LABEL}")
+
+    model_name = st.text_input("Ollama cloud model", value=DEFAULT_LLM_MODEL)
     top_k = st.slider("Top K chunks", min_value=1, max_value=8, value=3)
+
     uploaded_files = st.file_uploader(
         "Upload documents",
         type=["pdf", "docx", "xlsx", "xls", "txt", "csv", "md"],
@@ -237,9 +292,13 @@ with st.sidebar:
                 st.session_state.messages = []
                 st.session_state.chat_history_pairs = []
             if store is not None:
-                st.success(f"Indexed {len(loaded_docs)} file(s) into {chunk_count} chunk(s).")
+                st.success(
+                    f"Indexed {len(loaded_docs)} file(s) into {chunk_count} chunk(s)."
+                )
             else:
-                st.error("No readable text could be extracted from the uploaded files.")
+                st.error(
+                    "No readable text could be extracted from the uploaded files."
+                )
 
     if st.session_state.loaded_docs:
         st.markdown("### Indexed files")
@@ -248,6 +307,8 @@ with st.sidebar:
         st.write(f"Chunks: {st.session_state.chunk_count}")
 
 st.markdown("---")
+
+# ---------- CHAT HISTORY DISPLAY ----------
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -262,6 +323,8 @@ for message in st.session_state.messages:
                     seen.add(key)
                     st.markdown(f"**{src['source']}**")
                     st.write(src["text"][:1200])
+
+# ---------- CHAT INPUT ----------
 
 user_prompt = st.chat_input("Ask a question about your uploaded documents")
 
@@ -292,13 +355,17 @@ if user_prompt:
                             seen.add(key)
                             st.markdown(f"**{src['source']}**")
                             st.write(src["text"][:1200])
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "sources": sources,
-                    })
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": answer,
+                            "sources": sources,
+                        }
+                    )
                     st.session_state.chat_history_pairs.append((user_prompt, answer))
                 except Exception as e:
                     err = f"Something went wrong: {e}"
                     st.error(err)
-                    st.session_state.messages.append({"role": "assistant", "content": err})
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": err}
+                    )
